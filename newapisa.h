@@ -18,7 +18,7 @@
     ----------------------+-----------------------------------------
     GetDiskFreeSpaceEx    | WANT_GETDISKFREESPACEEX_WRAPPER
     GetFileAttributesEx   | WANT_GETFILEATTRIBUTESEX_WRAPPER
-    GetLongPathName       | WANT_GETLONGPATHNAME_WRAPPER (not implemented)
+    GetLongPathName       | WANT_GETLONGPATHNAME_WRAPPER
     IsDebuggerPresent     | WANT_ISDEBUGGERPRESENT_WRAPPER
 
     In addition one source file has to define all used defines above
@@ -247,6 +247,185 @@ LPFNGETFILEATTRIBUTESEX GetFileAttributesEx = &NewApisA_GetFileAttributesEx_Load
     GetLongPathName
 */
 #ifdef WANT_GETLONGPATHNAME_WRAPPER
+
+#undef GetLongPathName
+#define GetLongPathName _GetLongPathName
+
+typedef DWORD (WINAPI* LPFNGETLONGPATHNAME)
+(
+    LPCTSTR lpszShortPath,
+    LPTSTR  lpszLongPath,
+    DWORD   cchBuffer
+);
+extern LPFNGETLONGPATHNAME GetLongPathName;
+
+#ifdef COMPILE_NEWAPIS_STUBS
+
+static LPTSTR WINAPI NewApisA_GetLongPathName_StrRChr(LPTSTR const lpszString, TCHAR const chNeedle)
+{
+    LPTSTR lpszMatch = NULL;
+    LPTSTR lpszIdx;
+
+    for(lpszIdx = lpszString; lpszIdx[0]!=TEXT('\0'); lpszIdx = CharNext(lpszIdx))
+    {
+        if(lpszIdx[0]==chNeedle)
+        {
+            lpszMatch = lpszIdx;
+        }
+    }
+
+    return lpszMatch;
+}
+
+static BOOL WINAPI NewApisA_GetLongPathName_GetLongR(LPTSTR const lpszLongPath, DWORD const dwLongPathSize, LPDWORD const lpdwLength)
+{
+    BOOL bSuccess = FALSE;
+    DWORD const dwAttributes = GetFileAttributes(lpszLongPath);
+    DWORD dwLength = 0;
+
+    /* must be actual path */
+    if(dwAttributes!=INVALID_FILE_ATTRIBUTES)
+    {
+        if(!(dwAttributes&FILE_ATTRIBUTE_DIRECTORY)  /* file */
+        || ( lstrcmp(lpszLongPath, TEXT("."))!=0 && lstrcmp(lpszLongPath, TEXT(".."))!=0 && !( IsCharAlpha(lpszLongPath[0]) && lpszLongPath[1]==TEXT(':') && lpszLongPath[2]==TEXT('\0') ) ))  /* real directory */
+        {
+            WIN32_FIND_DATA Wfd = { 0 };
+            HANDLE const hFind = FindFirstFile(lpszLongPath, &Wfd);
+
+            if(hFind!=INVALID_HANDLE_VALUE)
+            {
+                FindClose(hFind);
+
+                if(lstrcmp(Wfd.cFileName, TEXT("."))!=0)
+                {
+                    LPTSTR const lpszSlash = NewApisA_GetLongPathName_StrRChr(lpszLongPath, TEXT('\\'));
+
+                    if(lpszSlash!=NULL)
+                    {/* parent */
+                        lpszSlash[0] = TEXT('\0');
+
+                        if(NewApisA_GetLongPathName_GetLongR(lpszLongPath, dwLongPathSize, &dwLength))
+                        {
+                            DWORD const dwNewLength = dwLength+lstrlen(Wfd.cFileName)+1;
+
+                            if(dwNewLength<dwLongPathSize)
+                            {/* update path with long file name */
+                                wsprintf(&lpszLongPath[dwLength], TEXT("\\%s"), Wfd.cFileName);
+                            }
+
+                            dwLength = dwNewLength;
+                            bSuccess = TRUE;
+                        }
+                    }
+                    else
+                    {/* relative path */
+                        dwLength+= lstrlen(lpszLongPath);
+
+                        if(dwLength<dwLongPathSize)
+                        {
+                            lstrcpy(lpszLongPath, Wfd.cFileName);
+                        }
+
+                        bSuccess = TRUE;
+                    }
+                }
+                else
+                {/* network share root */
+                    dwLength+= lstrlen(lpszLongPath);
+                    bSuccess = TRUE;
+                }
+            }
+        }
+        else
+        {/* other things that do not have long names */
+            dwLength+= lstrlen(lpszLongPath);
+            bSuccess = TRUE;
+        }
+    }
+    else
+    {/* non-directory path portion */
+        dwLength+= lstrlen(lpszLongPath);
+        bSuccess = TRUE;
+    }
+
+    lpdwLength[0]+= dwLength;
+    return bSuccess;
+}
+
+/* Unlike the official fallback, this works more closely to the
+actual function in regards to failures and handling of relative
+paths. It also does not depend upon IE nor COM to be installed. */
+static DWORD WINAPI NewApisA_GetLongPathName_Fallback
+(
+    LPCTSTR lpszShortPath,
+    LPTSTR  lpszLongPath,
+    DWORD   dwLongPathSize
+)
+{
+    DWORD dwLength = 0;
+
+    /* path must exist, otherwise no way to tell the long name,
+    because there is not any */
+    if(GetFileAttributes(lpszShortPath)!=INVALID_FILE_ATTRIBUTES)
+    {
+        DWORD const dwShortLength = lstrlen(lpszShortPath);
+
+        if(dwShortLength<dwLongPathSize)
+        {
+            /* pre-load destination buffer with short path */
+            lstrcpy(lpszLongPath, lpszShortPath);
+
+            if(!NewApisA_GetLongPathName_GetLongR(lpszLongPath, dwLongPathSize, &dwLength))
+            {/* if cannot be resolved, default to short path */
+                dwLength = dwShortLength;
+                lstrcpy(lpszLongPath, lpszShortPath);
+            }
+        }
+        else
+        {
+            dwLength = dwShortLength;
+            SetLastError(ERROR_BUFFER_OVERFLOW);
+        }
+    }
+
+    return dwLength;
+}
+
+static DWORD WINAPI NewApisA_GetLongPathName_Loader
+(
+    LPCTSTR lpszShortPath,
+    LPTSTR  lpszLongPath,
+    DWORD   cchBuffer
+)
+{
+    LPFNGETLONGPATHNAME const Func = (LPFNGETLONGPATHNAME)GetProcAddress(GetModuleHandle(TEXT("kernel32.dll")),
+#ifndef UNICODE
+        "GetLongPathNameA"
+#else  /* UNICODE */
+        "GetLongPathNameW"
+#endif  /* UNICODE */
+    );
+
+    if(Func!=NULL)
+    {
+        BOOL const bResult = Func(lpszShortPath, lpszLongPath, cchBuffer);
+
+        if(bResult || GetLastError()!=ERROR_CALL_NOT_IMPLEMENTED)
+        {
+            GetLongPathName = Func;
+            return bResult;
+        }
+    }
+
+    GetLongPathName = &NewApisA_GetLongPathName_Fallback;
+
+    return NewApisA_GetLongPathName_Fallback(lpszShortPath, lpszLongPath, cchBuffer);
+}
+
+LPFNGETLONGPATHNAME GetLongPathName = &NewApisA_GetLongPathName_Loader;
+
+#endif  /* COMPILE_NEWAPIS_STUBS */
+
 #endif  /* WANT_GETLONGPATHNAME_WRAPPER */
 
 /*
